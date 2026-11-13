@@ -378,6 +378,34 @@ def to_jax_spec(tree: jaxtyping.PyTree) -> jaxtyping.PyTree:
   return jax.tree.map(_convert_leaf, tree)
 
 
+def restore_shardings(
+    specs: jaxtyping.PyTree,
+    reference: jaxtyping.PyTree,
+) -> jaxtyping.PyTree:
+  """Re-attaches shardings that `jax.export.symbolic_args_specs` discards.
+
+  `symbolic_args_specs` rebuilds each leaf to carry symbolic dimensions and
+  does not preserve `sharding`. Losing it is silent: the exported function ends
+  up with no sharding annotations, the manifest records none, and the runtime
+  infers a single device from the function signature.
+
+  Args:
+    specs: PyTree of `jax.ShapeDtypeStruct` whose shardings may have been lost.
+    reference: PyTree with the same structure holding the original shardings.
+
+  Returns:
+    `specs`, with any leaf that lost a sharding rebuilt to carry it again.
+  """
+
+  def _restore(spec, ref):
+    sharding = getattr(ref, "sharding", None)
+    if sharding is None or getattr(spec, "sharding", None) is not None:
+      return spec
+    return jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=sharding)
+
+  return jax.tree.map(_restore, specs, reference)
+
+
 def _concretize_polymorphic_shapes(
     symbolic_specs: (
         Mapping[Any, jaxtyping.PyTree[jax.ShapeDtypeStruct]]
@@ -426,4 +454,8 @@ def _concretize_spec(
             f" {symbol_to_value}"
         )
       concrete_shape.append(symbol_to_value[d_str])
-  return jax.ShapeDtypeStruct(tuple(concrete_shape), symbolic_spec.dtype)
+  return jax.ShapeDtypeStruct(
+      tuple(concrete_shape),
+      symbolic_spec.dtype,
+      sharding=getattr(symbolic_spec, "sharding", None),
+  )

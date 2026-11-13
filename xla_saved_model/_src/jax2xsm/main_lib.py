@@ -483,14 +483,19 @@ def convert_apply_fn_bundle_to_shlo(
     weights_name: str | None = None,
 ) -> Sequence[shlo_function.ShloFunction]:
   """Converts an ApplyFnBundle to SHLO functions."""
+  jax_specs = utils.to_jax_spec((params, input_signature))
   args_specs = jax_export.symbolic_args_specs(
-      args=utils.to_jax_spec((params, input_signature)),
+      args=jax_specs,
       shapes_specs=(
           "...",
           apply_fn_bundle.input_polymorphic_shapes,
       ),
       constraints=apply_fn_bundle.polymorphic_constraints,
   )
+  # `symbolic_args_specs` does not preserve `sharding`; without this the
+  # exported function carries no sharding annotations and the runtime infers a
+  # single device, silently serving a sharded model on one accelerator.
+  args_specs = utils.restore_shardings(args_specs, jax_specs)
   if apply_fn_bundle.input_polymorphic_shape_symbol_values is not None:
     args_specs_list = utils._concretize_polymorphic_shapes(
         args_specs,

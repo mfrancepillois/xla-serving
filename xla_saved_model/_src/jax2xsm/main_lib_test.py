@@ -30,6 +30,7 @@ from xla_saved_model.protos import type_pb2
 from xla_saved_model._src.core import persistence_lib as xsm_core
 from xla_saved_model._src.core import test_utils
 from xla_saved_model._src.jax2xsm import main_lib
+from xla_saved_model._src.jax2xsm import typing as jax2xsm_typing
 from xla_saved_model._src.test_utils import jax_mnist
 
 os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
@@ -473,6 +474,70 @@ class MainLibTest(test_utils.XsmTestCase):
     self.assertNotEmpty(
         os.listdir(checkpoint_abs_path),
         f"Checkpoint directory '{checkpoint_abs_path}' is empty.",
+    )
+
+  @parameterized.named_parameters(
+      dict(testcase_name='_concrete', symbol_values=None),
+      dict(testcase_name='_polymorphic', symbol_values={'b': [4]}),
+  )
+  def test_sharding_on_params_reaches_signature(self, symbol_values):
+    """Sharding carried by `params` must survive `ApplyFnBundle` conversion.
+
+    This is the path `xla_saved_model.save()` takes, and it differs from
+    `test_sharded_jax_e2e`, which supplies shardings through
+    `jax.jit(in_shardings=...)` instead. Two steps here rebuild
+    `ShapeDtypeStruct` leaves and used to drop `sharding`:
+    `jax.export.symbolic_args_specs` and, for the polymorphic case,
+    `utils._concretize_spec`. Losing it is silent -- the manifest ends up with
+    no sharding annotations and the runtime infers a single device, serving a
+    sharded model on one accelerator.
+    """
+    if jax.device_count() < 2:
+      self.skipTest('needs at least 2 devices to shard across')
+    # Take exactly 2 devices: `create_device_mesh` otherwise requires the mesh
+    # shape to account for every device the backend exposes.
+    devices = mesh_utils.create_device_mesh((2,), devices=jax.devices()[:2])
+    mesh = jax_sharding.Mesh(devices, ('x',))
+    w_sharding = jax_sharding.NamedSharding(
+        mesh, jax_sharding.PartitionSpec('x', None)
+    )
+
+    def _apply_fn(params, inputs):
+      return {'out': jnp.dot(inputs['features'], params['w'])}
+
+    params = {'w': jax.device_put(jnp.ones((8, 4), jnp.float32), w_sharding)}
+    if symbol_values is None:
+      input_signature = {'features': jax.ShapeDtypeStruct((4, 8), jnp.float32)}
+      polymorphic_shapes = None
+    else:
+      # A symbolic dimension is spelled as a string, not None.
+      input_signature = {
+          'features': jax.ShapeDtypeStruct(('b', 8), jnp.float32)
+      }
+      polymorphic_shapes = {'features': 'b, _'}
+
+    shlo_fns = main_lib.convert_apply_fn_bundle_to_shlo(
+        jax2xsm_typing.ApplyFnBundle(
+            apply_fn=_apply_fn,
+            input_polymorphic_shapes=polymorphic_shapes,
+            input_polymorphic_shape_symbol_values=symbol_values,
+            jax_export_kwargs={'platforms': ['cpu']},
+        ),
+        params,
+        input_signature,
+        jax_mesh=mesh,
+    )
+
+    self.assertNotEmpty(shlo_fns)
+    w_spec = shlo_fns[0].input_signature[0][0]['w']
+    self.assertIsNotNone(
+        w_spec.sharding, 'sharding was dropped during conversion'
+    )
+    self.assertEqual(
+        list(w_spec.sharding.tile_assignment_dimensions),
+        [2, 1],
+        'sharding reached the signature but does not describe 2 tiles, so the'
+        ' runtime would infer the wrong device count',
     )
 
   def test_host_placement_e2e(self):
