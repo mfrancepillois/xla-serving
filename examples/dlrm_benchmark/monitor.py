@@ -24,7 +24,8 @@ kill at any point leaves a valid file:
     "peak_rss_mb": ..., "avg_rss_mb": ...,                       # see below
     "memory_metric": "rss" | "pss",
     "num_threads_max": ..., "num_processes_max": ...,
-    "gpu": {"util_avg_pct": ..., "util_max_pct": ..., "mem_used_max_mb": ...}
+    "gpu": {"index": ..., "util_avg_pct": ..., "util_max_pct": ...,
+            "mem_used_max_mb": ...}
   }
 
 CPU and memory are summed over the root process and all its descendants, so a
@@ -85,7 +86,11 @@ def _define_flags() -> _Flags:
           ' run_benchmark.sh --platform can be forwarded verbatim).',
       ),
       gpu_index=flags.DEFINE_integer(
-          'gpu_index', 0, 'nvidia-smi / rocm-smi GPU index.'
+          'gpu_index',
+          -1,
+          'GPU to sample. -1 resolves it from the server process tree via'
+          ' amd-smi (ROCm only, since HIP and rocm-smi device orders differ);'
+          ' CUDA falls back to index 0.',
       ),
   )
 
@@ -240,6 +245,43 @@ def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
 _GPU_SAMPLERS = {'cuda': _nvidia_gpu_sample, 'rocm': _rocm_gpu_sample}
 
 
+def _rocm_gpu_for_pids(pids: set[int]) -> int | None:
+  """Finds the AMD GPU index holding an allocation for one of `pids`.
+
+  HIP device ordering and `rocm-smi`'s `cardN` ordering do not agree: with
+  `HIP_VISIBLE_DEVICES=0` a server has been observed on `card3`. Sampling a
+  fixed index therefore reports an unrelated, idle GPU. `amd-smi` maps
+  processes to devices directly, which removes the guess; its GPU index does
+  agree with `rocm-smi`'s card index.
+
+  Returns `None` while no allocation is visible yet, so the caller can retry.
+  """
+  if not pids or not shutil.which('amd-smi'):
+    return None
+  try:
+    data = json.loads(
+        subprocess.run(
+            ['amd-smi', 'process', '--json'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout
+    )
+  except (subprocess.SubprocessError, json.JSONDecodeError):
+    return None
+  for entry in data if isinstance(data, list) else []:
+    for proc in entry.get('process_list', []):
+      # `process_info` is the string "No running processes detected" when the
+      # device is idle, and a dict otherwise.
+      info = proc.get('process_info')
+      if isinstance(info, dict) and info.get('pid') in pids:
+        gpu = entry.get('gpu')
+        if isinstance(gpu, int):
+          return gpu
+  return None
+
+
 def _cpu_affinity(proc: Any) -> list[int] | None:
   if not hasattr(proc, 'cpu_affinity'):
     return None
@@ -277,6 +319,13 @@ def main(argv: Sequence[str], f: _Flags) -> None:
   gpu_mem_max = 0.0
   summary: dict[str, Any] = {}
 
+  # `-1` means resolve from the server's PIDs, which only ROCm supports.
+  gpu_index: int | None = None
+  if f.gpu_index.value >= 0:
+    gpu_index = f.gpu_index.value
+  elif f.accelerator.value != 'rocm':
+    gpu_index = 0
+
   while not stop_event.is_set():
     stop_event.wait(f.interval_s.value)
     if stop_event.is_set() and sampler.samples > 0:
@@ -286,10 +335,15 @@ def main(argv: Sequence[str], f: _Flags) -> None:
       break
     sampler_fn = _GPU_SAMPLERS.get(f.accelerator.value)
     if sampler_fn is not None:
-      g = sampler_fn(f.gpu_index.value)
-      if g is not None:
-        gpu_utils.append(g[0])
-        gpu_mem_max = max(gpu_mem_max, g[1])
+      if gpu_index is None:
+        # Resolution needs a visible allocation, which a server may not have
+        # made yet, so keep retrying until it succeeds.
+        gpu_index = _rocm_gpu_for_pids({p.pid for p in _tree(root)})
+      if gpu_index is not None:
+        g = sampler_fn(gpu_index)
+        if g is not None:
+          gpu_utils.append(g[0])
+          gpu_mem_max = max(gpu_mem_max, g[1])
     wall = time.monotonic() - t0
     summary = {
         'pid': f.pid.value,
@@ -306,6 +360,7 @@ def main(argv: Sequence[str], f: _Flags) -> None:
     }
     if gpu_utils:
       summary['gpu'] = {
+          'index': gpu_index,
           'util_avg_pct': sum(gpu_utils) / len(gpu_utils),
           'util_max_pct': max(gpu_utils),
           'mem_used_max_mb': gpu_mem_max,

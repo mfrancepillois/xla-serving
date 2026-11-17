@@ -153,8 +153,15 @@ Two further points are specific to AMD hosts:
   `XLA_PYTHON_CLIENT_PREALLOCATE=false` so JAX does not reserve 75% of each
   visible GPU's VRAM; export it yourself to override.
 
-`monitor.py` reads AMD GPU utilisation and VRAM from `rocm-smi`. Everything
-else — export, load generation, parity checking, reporting — is unchanged.
+`monitor.py` reads AMD GPU utilisation and VRAM from `rocm-smi`, resolving
+*which* GPU via `amd-smi process` against the server's process tree. Do not
+assume `HIP_VISIBLE_DEVICES=0` means `card0` — HIP and `rocm-smi` order devices
+differently, and a server pinned to HIP device 0 has been observed on `card3`.
+Pass `--gpu_index` only to override that detection. The resolved index is
+recorded as `gpu.index` in each `*.monitor.json`.
+
+Everything else — export, load generation, parity checking, reporting — is
+unchanged.
 
 ## Running individual tools
 
