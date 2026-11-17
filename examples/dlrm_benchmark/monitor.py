@@ -24,8 +24,8 @@ kill at any point leaves a valid file:
     "peak_rss_mb": ..., "avg_rss_mb": ...,                       # see below
     "memory_metric": "rss" | "pss",
     "num_threads_max": ..., "num_processes_max": ...,
-    "gpu": {"index": ..., "util_avg_pct": ..., "util_max_pct": ...,
-            "mem_used_max_mb": ...}
+    "gpu": {"index": ..., "index_source": ..., "util_avg_pct": ...,
+            "util_max_pct": ..., "mem_used_max_mb": ...}
   }
 
 CPU and memory are summed over the root process and all its descendants, so a
@@ -195,8 +195,8 @@ def _nvidia_gpu_sample(index: int) -> tuple[float, float] | None:
     return None
 
 
-def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
-  """Queries `(gpu_util_pct, mem_used_mb)` for GPU `index` via `rocm-smi`.
+def _rocm_all_cards() -> dict[int, tuple[float, float]]:
+  """Reads `{card: (gpu_util_pct, mem_used_mb)}` for every GPU via `rocm-smi`.
 
   `rocm-smi` has no per-device query flag, so it reports every GPU at once:
 
@@ -208,7 +208,7 @@ def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
   MiB so the value means the same thing as the `nvidia-smi` one.
   """
   if not shutil.which('rocm-smi'):
-    return None
+    return {}
   try:
     out = subprocess.run(
         ['rocm-smi', '--showuse', '--showmeminfo', 'vram', '--csv'],
@@ -218,7 +218,7 @@ def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
         check=True,
     ).stdout.strip().splitlines()
   except subprocess.SubprocessError:
-    return None
+    return {}
   # Some builds wrap the CSV in banner lines, so find the header rather than
   # assuming it is the first line.
   util_col = mem_col = None
@@ -230,16 +230,27 @@ def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
       out = out[i + 1 :]
       break
   else:
-    return None
+    return {}
+  cards: dict[int, tuple[float, float]] = {}
   for line in out:
     row = [c.strip() for c in line.split(',')]
-    if row[0] != f'card{index}' or len(row) <= max(util_col, mem_col):
+    if not row[0].startswith('card') or not row[0][4:].isdigit():
+      continue
+    if len(row) <= max(util_col, mem_col):
       continue
     try:
-      return float(row[util_col]), float(row[mem_col]) / (1 << 20)
+      cards[int(row[0][4:])] = (
+          float(row[util_col]),
+          float(row[mem_col]) / (1 << 20),
+      )
     except ValueError:
-      return None
-  return None
+      continue
+  return cards
+
+
+def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
+  """Queries `(gpu_util_pct, mem_used_mb)` for GPU `index` via `rocm-smi`."""
+  return _rocm_all_cards().get(index)
 
 
 _GPU_SAMPLERS = {'cuda': _nvidia_gpu_sample, 'rocm': _rocm_gpu_sample}
@@ -311,6 +322,49 @@ def _rocm_gpu_for_pids(pids: set[int]) -> int | None:
   return None
 
 
+# A card must hold this many times the runner-up's VRAM to be judged "the one
+# in use". On an idle 8-GPU host every card sits within noise of the others,
+# and picking the nominal maximum would be arbitrary.
+_BUSIEST_CARD_RATIO = 2.0
+
+
+def _rocm_busiest_card() -> int | None:
+  """Picks the GPU holding conspicuously more VRAM than any other.
+
+  A fallback for when `amd-smi` cannot map PIDs to devices. The benchmark pins
+  the server to one GPU, so on a host where the other cards are idle the one
+  in use stands out by orders of magnitude. Returns `None` when no card stands
+  out, rather than guessing -- a shared host where someone else's job is the
+  largest consumer would otherwise be silently mis-attributed.
+  """
+  cards = _rocm_all_cards()
+  if not cards:
+    return None
+  if len(cards) == 1:
+    return next(iter(cards))
+  ranked = sorted(cards, key=lambda i: cards[i][1], reverse=True)
+  top, runner_up = cards[ranked[0]][1], cards[ranked[1]][1]
+  if top < _BUSIEST_CARD_RATIO * runner_up:
+    _gpu_resolution_failed(
+        f'no GPU stands out by VRAM (top card{ranked[0]}={top:.0f} MiB vs '
+        f'card{ranked[1]}={runner_up:.0f} MiB)'
+    )
+    return None
+  return ranked[0]
+
+
+def _resolve_rocm_gpu(pids: set[int]) -> tuple[int | None, str | None]:
+  """Returns `(gpu_index, how_it_was_resolved)`."""
+  gpu = _rocm_gpu_for_pids(pids)
+  if gpu is not None:
+    return gpu, 'amd-smi-pid'
+  gpu = _rocm_busiest_card()
+  if gpu is not None:
+    _warn_once(f'Falling back to VRAM-based GPU detection: card{gpu}')
+    return gpu, 'max-vram'
+  return None, None
+
+
 def _cpu_affinity(proc: Any) -> list[int] | None:
   if not hasattr(proc, 'cpu_affinity'):
     return None
@@ -348,12 +402,13 @@ def main(argv: Sequence[str], f: _Flags) -> None:
   gpu_mem_max = 0.0
   summary: dict[str, Any] = {}
 
-  # `-1` means resolve from the server's PIDs, which only ROCm supports.
+  # `-1` means auto-detect, which only ROCm supports.
   gpu_index: int | None = None
+  gpu_index_source: str | None = None
   if f.gpu_index.value >= 0:
-    gpu_index = f.gpu_index.value
+    gpu_index, gpu_index_source = f.gpu_index.value, 'flag'
   elif f.accelerator.value != 'rocm':
-    gpu_index = 0
+    gpu_index, gpu_index_source = 0, 'default'
 
   while not stop_event.is_set():
     stop_event.wait(f.interval_s.value)
@@ -367,7 +422,9 @@ def main(argv: Sequence[str], f: _Flags) -> None:
       if gpu_index is None:
         # Resolution needs a visible allocation, which a server may not have
         # made yet, so keep retrying until it succeeds.
-        gpu_index = _rocm_gpu_for_pids({p.pid for p in _tree(root)})
+        gpu_index, gpu_index_source = _resolve_rocm_gpu(
+            {p.pid for p in _tree(root)}
+        )
       if gpu_index is not None:
         g = sampler_fn(gpu_index)
         if g is not None:
@@ -390,6 +447,7 @@ def main(argv: Sequence[str], f: _Flags) -> None:
     if gpu_utils:
       summary['gpu'] = {
           'index': gpu_index,
+          'index_source': gpu_index_source,
           'util_avg_pct': sum(gpu_utils) / len(gpu_utils),
           'util_max_pct': max(gpu_utils),
           'mem_used_max_mb': gpu_mem_max,
