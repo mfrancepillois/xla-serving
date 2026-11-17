@@ -245,6 +245,21 @@ def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
 _GPU_SAMPLERS = {'cuda': _nvidia_gpu_sample, 'rocm': _rocm_gpu_sample}
 
 
+@functools.lru_cache(maxsize=None)
+def _warn_once(message: str) -> None:
+  logging.warning('%s', message)
+
+
+def _gpu_resolution_failed(reason: str) -> None:
+  """Logs why GPU resolution failed, once per distinct reason.
+
+  Resolution is retried every sample, so this must not log per sample; but a
+  silent failure leaves an empty `gpu` block in the summary with no way to
+  tell whether the GPU was idle or never found.
+  """
+  _warn_once(f'Cannot resolve GPU to sample: {reason}')
+
+
 def _rocm_gpu_for_pids(pids: set[int]) -> int | None:
   """Finds the AMD GPU index holding an allocation for one of `pids`.
 
@@ -256,29 +271,43 @@ def _rocm_gpu_for_pids(pids: set[int]) -> int | None:
 
   Returns `None` while no allocation is visible yet, so the caller can retry.
   """
-  if not pids or not shutil.which('amd-smi'):
+  if not pids:
+    _gpu_resolution_failed('monitored process tree is empty')
+    return None
+  if not shutil.which('amd-smi'):
+    _gpu_resolution_failed('amd-smi not found on PATH')
     return None
   try:
-    data = json.loads(
-        subprocess.run(
-            ['amd-smi', 'process', '--json'],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        ).stdout
+    proc = subprocess.run(
+        ['amd-smi', 'process', '--json'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
     )
-  except (subprocess.SubprocessError, json.JSONDecodeError):
+  except subprocess.SubprocessError as e:
+    _gpu_resolution_failed(f'amd-smi process failed: {e}')
     return None
+  try:
+    data = json.loads(proc.stdout)
+  except json.JSONDecodeError:
+    _gpu_resolution_failed(f'amd-smi JSON unparseable: {proc.stdout[:200]!r}')
+    return None
+  seen: dict[Any, list[int]] = {}
   for entry in data if isinstance(data, list) else []:
-    for proc in entry.get('process_list', []):
+    for p in entry.get('process_list', []):
       # `process_info` is the string "No running processes detected" when the
       # device is idle, and a dict otherwise.
-      info = proc.get('process_info')
-      if isinstance(info, dict) and info.get('pid') in pids:
-        gpu = entry.get('gpu')
-        if isinstance(gpu, int):
-          return gpu
+      info = p.get('process_info')
+      if not isinstance(info, dict):
+        continue
+      seen.setdefault(entry.get('gpu'), []).append(info.get('pid'))
+      if info.get('pid') in pids and isinstance(entry.get('gpu'), int):
+        return entry['gpu']
+  _gpu_resolution_failed(
+      f'no amd-smi GPU holds any of pids {sorted(pids)}; GPUs with '
+      f'processes: {seen or "none"}'
+  )
   return None
 
 
