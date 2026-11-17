@@ -106,6 +106,17 @@ examples/dlrm_benchmark/run_benchmark.sh \
   --num_threads 8 \
   --work_dir /tmp/dlrm_benchmark
 
+# AMD GPU (e.g. MI300X / MI350X). No container image is published for ROCm,
+# so pass a locally built --xse_bin; see "AMD GPUs" below.
+HIP_VISIBLE_DEVICES=0 \
+examples/dlrm_benchmark/run_benchmark.sh \
+  --platform rocm \
+  --xse_bin bazel-bin/runtime/serving/gcp/server/xla_serving_main_gpu \
+  --server_cpus 0-7 \
+  --client_cpus 8-11 \
+  --num_threads 8 \
+  --work_dir /tmp/dlrm_benchmark
+
 # CPU functional smoke test (~5 min, capped vocabularies; pass --server_cpus
 # and --client_cpus when timing on CPU)
 examples/dlrm_benchmark/run_benchmark.sh \
@@ -121,6 +132,29 @@ To benchmark a locally compiled server binary instead of a container image, pass
 `--xse_bin bazel-bin/runtime/serving/gcp/server/xla_serving_main_{cpu,gpu,tpu}`
 (see [Serving and runtime](../../docs/guides/serving.md)). Pass `--dry_run` to
 inspect all resolved commands without executing them.
+
+### AMD GPUs
+
+`--platform rocm` uses the same `xla_serving_main_gpu` binary as CUDA, built
+with `--config=rocm`; see
+[Validating XLA Serving Engine on AMD GPUs](../../ROCM_VALIDATION.md) for the
+build and for putting the host ROCm libraries on `LD_LIBRARY_PATH` (the script
+refuses to start a server with unresolved libraries, and prints the fix).
+
+Two further points are specific to AMD hosts:
+
+- **The `py*` arms need a working ROCm JAX**, not just the server binary. The
+  PyPI `jax-rocm7-plugin` targets ROCm 7.14; on a newer install, build
+  jax/jaxlib from source listing *every* `gfx` target you will run on. The XSE
+  arms have no such requirement.
+- **Pin to one GPU** with `HIP_VISIBLE_DEVICES=0`. The suite is single-node,
+  single-accelerator by design, and on a multi-GPU Instinct host the Python
+  baselines would otherwise initialise all of them. The script also defaults
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false` so JAX does not reserve 75% of each
+  visible GPU's VRAM; export it yourself to override.
+
+`monitor.py` reads AMD GPU utilisation and VRAM from `rocm-smi`. Everything
+else — export, load generation, parity checking, reporting — is unchanged.
 
 ## Running individual tools
 

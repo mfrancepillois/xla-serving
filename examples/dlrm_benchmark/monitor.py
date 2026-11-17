@@ -34,7 +34,8 @@ charged for all of them. For such trees memory is the proportional set size
 shared-memory rings) would be counted once per process; the key names stay
 `*_rss_mb` for report compatibility and `memory_metric` says which it was.
 
-GPU numbers come from `nvidia-smi` (if present and `--accelerator=cuda`).
+GPU numbers come from `nvidia-smi` (`--accelerator=cuda`) or `rocm-smi`
+(`--accelerator=rocm`), when the tool is present.
 TPU utilisation is not sampled (there is no stable CLI for it); HBM usage can be
 read from the server logs instead.
 """
@@ -79,11 +80,13 @@ def _define_flags() -> _Flags:
       accelerator=flags.DEFINE_enum(
           'accelerator',
           'none',
-          ['none', 'cpu', 'cuda', 'tpu'],
+          ['none', 'cpu', 'cuda', 'rocm', 'tpu'],
           'Accelerator to sample ("cpu" is an alias of "none" so the value of'
           ' run_benchmark.sh --platform can be forwarded verbatim).',
       ),
-      gpu_index=flags.DEFINE_integer('gpu_index', 0, 'nvidia-smi GPU index.'),
+      gpu_index=flags.DEFINE_integer(
+          'gpu_index', 0, 'nvidia-smi / rocm-smi GPU index.'
+      ),
   )
 
 
@@ -164,7 +167,7 @@ class _TreeSampler:
     return True
 
 
-def _gpu_sample(index: int) -> tuple[float, float] | None:
+def _nvidia_gpu_sample(index: int) -> tuple[float, float] | None:
   """Queries `(gpu_util_pct, mem_used_mb)` for GPU `index` via `nvidia-smi`."""
   if not shutil.which('nvidia-smi'):
     return None
@@ -185,6 +188,56 @@ def _gpu_sample(index: int) -> tuple[float, float] | None:
     return float(util), float(mem)
   except (subprocess.SubprocessError, ValueError):
     return None
+
+
+def _rocm_gpu_sample(index: int) -> tuple[float, float] | None:
+  """Queries `(gpu_util_pct, mem_used_mb)` for GPU `index` via `rocm-smi`.
+
+  `rocm-smi` has no per-device query flag, so it reports every GPU at once:
+
+      device,GPU use (%),VRAM Total Memory (B),VRAM Total Used Memory (B)
+      card0,0,270566162432,297766912
+
+  Columns are located by header text rather than position, since their order
+  and exact wording have moved between ROCm releases. Bytes are converted to
+  MiB so the value means the same thing as the `nvidia-smi` one.
+  """
+  if not shutil.which('rocm-smi'):
+    return None
+  try:
+    out = subprocess.run(
+        ['rocm-smi', '--showuse', '--showmeminfo', 'vram', '--csv'],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.strip().splitlines()
+  except subprocess.SubprocessError:
+    return None
+  # Some builds wrap the CSV in banner lines, so find the header rather than
+  # assuming it is the first line.
+  util_col = mem_col = None
+  for i, line in enumerate(out):
+    cols = [c.strip().lower() for c in line.split(',')]
+    util_col = next((j for j, c in enumerate(cols) if 'use (%)' in c), None)
+    mem_col = next((j for j, c in enumerate(cols) if 'used memory' in c), None)
+    if util_col is not None and mem_col is not None:
+      out = out[i + 1 :]
+      break
+  else:
+    return None
+  for line in out:
+    row = [c.strip() for c in line.split(',')]
+    if row[0] != f'card{index}' or len(row) <= max(util_col, mem_col):
+      continue
+    try:
+      return float(row[util_col]), float(row[mem_col]) / (1 << 20)
+    except ValueError:
+      return None
+  return None
+
+
+_GPU_SAMPLERS = {'cuda': _nvidia_gpu_sample, 'rocm': _rocm_gpu_sample}
 
 
 def _cpu_affinity(proc: Any) -> list[int] | None:
@@ -231,8 +284,9 @@ def main(argv: Sequence[str], f: _Flags) -> None:
     if not sampler.sample():
       logging.warning('Process %d exited; stopping monitor', f.pid.value)
       break
-    if f.accelerator.value == 'cuda':
-      g = _gpu_sample(f.gpu_index.value)
+    sampler_fn = _GPU_SAMPLERS.get(f.accelerator.value)
+    if sampler_fn is not None:
+      g = sampler_fn(f.gpu_index.value)
       if g is not None:
         gpu_utils.append(g[0])
         gpu_mem_max = max(gpu_mem_max, g[1])

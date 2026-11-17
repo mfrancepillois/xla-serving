@@ -79,7 +79,7 @@ def _define_flags() -> _Flags:
       reference_device=flags.DEFINE_enum(
           'reference_device',
           'cpu',
-          ['cpu', 'cuda', 'tpu'],
+          list(python_server.DEVICES),
           'Local reference device.',
       ),
       model_name=flags.DEFINE_string(

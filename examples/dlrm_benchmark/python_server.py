@@ -85,8 +85,19 @@ DEFAULT_BATCHING_HANDLER_THREADS = 512
 _JAX_PLATFORMS_FOR_DEVICE = {
     'cpu': 'cpu',
     'cuda': 'cuda,cpu',
+    'rocm': 'rocm,cpu',
     'tpu': 'tpu,cpu',
 }
+
+# `jax.devices()` groups both GPU backends under the `gpu` alias.
+_JAX_PLATFORM_ALIAS = {
+    'cpu': 'cpu',
+    'cuda': 'gpu',
+    'rocm': 'gpu',
+    'tpu': 'tpu',
+}
+
+DEVICES = tuple(_JAX_PLATFORMS_FOR_DEVICE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,7 +158,7 @@ def define_flags(
       device=flags.DEFINE_enum(
           'device',
           'cpu',
-          ['cpu', 'cuda', 'tpu'],
+          list(DEVICES),
           'Device for the DCNv2 model.',
           flag_values=flag_values,
       ),
@@ -271,7 +282,7 @@ def restrict_jax_platforms(device: str) -> None:
   An explicit `JAX_PLATFORMS` in the environment is honoured as is.
 
   Args:
-    device: `cpu`, `cuda` or `tpu`.
+    device: one of `DEVICES`.
   """
   if os.environ.get('JAX_PLATFORMS'):
     return
@@ -279,7 +290,7 @@ def restrict_jax_platforms(device: str) -> None:
 
 
 def _jax_device(name: str) -> jax.Device:
-  platform = {'cpu': 'cpu', 'cuda': 'gpu', 'tpu': 'tpu'}[name]
+  platform = _JAX_PLATFORM_ALIAS[name]
   devices = jax.devices(platform)
   if not devices:
     raise RuntimeError(f'No JAX devices for platform {platform!r}')
@@ -797,7 +808,7 @@ def build_server(
   Args:
     weights_dir: Directory written by `export_benchmark_model.py`.
     port: Port to bind (0 = ephemeral).
-    device: `cpu`, `cuda` or `tpu`.
+    device: one of `DEVICES`.
     model_name: `model_spec.name` to accept.
     num_threads: Request-executing threads (gRPC handlers without batching).
     dynamic_batching: Coalesce concurrent requests.

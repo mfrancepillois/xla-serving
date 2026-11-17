@@ -44,18 +44,20 @@ usage() {
   local out=2
   [[ "${code}" == 0 ]] && out=1
   cat >&"${out}" <<EOF
-Usage: $0 --platform <cpu|cuda|tpu> [options]
+Usage: $0 --platform <cpu|cuda|rocm|tpu> [options]
 EOF
   cat >&"${out}" <<'EOF'
 
 Required:
-  --platform P            Target accelerator: cpu | cuda | tpu.
+  --platform P            Target accelerator: cpu | cuda | rocm | tpu.
 
 XSE server (pass --xse_image or --xse_bin; auto-detects bazel-bin if built):
   --xse_image IMAGE       Prebuilt container image, e.g.
                           us-docker.pkg.dev/xla-serving-engine/xla-serving/tpu-jax-only:nightly
                           us-docker.pkg.dev/xla-serving-engine/xla-serving/gpu-jax-cuda12:nightly
-  --xse_bin PATH          xla_serving_main_{cpu,gpu,tpu} binary.
+                          No image is published for rocm; use --xse_bin.
+  --xse_bin PATH          xla_serving_main_{cpu,gpu,tpu} binary (rocm uses the
+                          _gpu binary, built with --config=rocm).
   --tpu_library_path PATH Host libtpu.so path. Required only for a bare
                           --xse_bin TPU server when $TPU_LIBRARY_PATH and the
                           Python libtpu package are absent; if passed with
@@ -223,8 +225,8 @@ for arm in ${ARMS//,/ }; do
 done
 
 case "${PLATFORM}" in
-  cpu|cuda|tpu) ;;
-  *) echo "--platform must be cpu, cuda, or tpu" >&2; usage ;;
+  cpu|cuda|rocm|tpu) ;;
+  *) echo "--platform must be cpu, cuda, rocm, or tpu" >&2; usage ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -300,7 +302,7 @@ run() {
 
 case "${PLATFORM}" in
   cpu) XSE_TARGET="xla_serving_main_cpu" ;;
-  cuda) XSE_TARGET="xla_serving_main_gpu" ;;
+  cuda|rocm) XSE_TARGET="xla_serving_main_gpu" ;;
   tpu) XSE_TARGET="xla_serving_main_tpu" ;;
 esac
 
@@ -512,6 +514,26 @@ fi
 SERVER_ENV=()
 if [[ "${PLATFORM}" == "tpu" && -z "${XSE_IMAGE}" && -n "${TPU_LIBRARY_PATH_HOST}" ]]; then
   SERVER_ENV=(env "TPU_LIBRARY_PATH=${TPU_LIBRARY_PATH_HOST}")
+fi
+
+if [[ "${PLATFORM}" == "rocm" ]]; then
+  # The `py*` arms embed JAX, which otherwise reserves 75% of every visible
+  # GPU's VRAM; on a multi-GPU Instinct host that is hundreds of GiB held for a
+  # model that needs a few hundred MiB.
+  export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+  # The hermetic build links ROCm's shared libraries from the host, including a
+  # vendored set under rocm_sysdeps/lib. See ROCM_VALIDATION.md step 2.
+  if [[ -z "${XSE_IMAGE}" && -x "${XSE_BIN}" ]] &&
+     ldd "${XSE_BIN}" 2>/dev/null | grep -q "not found"; then
+    cat >&2 <<EOF
+${XSE_BIN} has unresolved shared libraries. Put the host ROCm libraries on the
+loader path before running:
+
+  export LD_LIBRARY_PATH=\$(find /opt/rocm -name "lib*.so.*" -path "*/lib/*" \\
+    -printf '%h\\n' | sort -u | paste -sd:)
+EOF
+    exit 1
+  fi
 fi
 
 if [[ -n "${SERVER_CPUS}" ]]; then
@@ -729,6 +751,9 @@ start_xse() {
               -e NVIDIA_VISIBLE_DEVICES=all
               -e NVIDIA_DRIVER_CAPABILITIES=all,compute,utility
               -e LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64) ;;
+      rocm) docker_args+=(--device=/dev/kfd --device=/dev/dri
+              --group-add video --security-opt seccomp=unconfined
+              -e PJRT_DEVICE=rocm) ;;
       tpu) docker_args+=(--privileged)
            if [[ -n "${TPU_LIBRARY_PATH_FLAG}" ]]; then
              docker_args+=(
